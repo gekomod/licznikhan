@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HAN energy meter",
+        "description": "Enter the IP address or hostname of the ESP reading the meter.",
+        "data": { "host": "ESP address" }
+      }
+    },
+    "error": { "cannot_connect": "Cannot connect to the ESP (check the address and that /json works)." },
+    "abort": { "already_configured": "This meter is already configured." }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Settings",
+        "data": { "scan_interval": "Poll the ESP every (s)" }
+      }
+    }
+  }
+}

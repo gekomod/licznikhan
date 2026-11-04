@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Licznik energii HAN",
+        "description": "Podaj adres IP lub nazwę hosta ESP z odczytem licznika.",
+        "data": { "host": "Adres ESP" }
+      }
+    },
+    "error": { "cannot_connect": "Nie można połączyć się z ESP (sprawdź adres i czy strona /json działa)." },
+    "abort": { "already_configured": "Ten licznik jest już dodany." }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Ustawienia",
+        "data": { "scan_interval": "Odpytywanie ESP co (s)" }
+      }
+    }
+  }
+}
