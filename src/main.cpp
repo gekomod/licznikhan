@@ -36,12 +36,14 @@ struct Settings {
   uint16_t cloudInterval;  // s, 0 = CLOUD_INTERVAL_S
   char appUser[41];   // login i haslo do aplikacji Android z rejestracji (tylko do wyswietlenia)
   char appPass[41];
+  uint8_t tariff;     // 0 = rejestry z licznika, 1 = G12, 2 = G12w, 3 = G13 (strefy liczone przez ESP, TAURON)
 };
 constexpr uint32_t SETTINGS_MAGIC_V1 = 0x48414E31;  // "HAN1"
 constexpr uint32_t SETTINGS_MAGIC_V2 = 0x48414E32;  // "HAN2" - bez pol chmury
 constexpr uint32_t SETTINGS_MAGIC_V3 = 0x48414E33;  // "HAN3" - bez adresu i interwalu chmury
 constexpr uint32_t SETTINGS_MAGIC_V4 = 0x48414E34;  // "HAN4" - bez danych logowania do aplikacji
-constexpr uint32_t SETTINGS_MAGIC = 0x48414E35;     // "HAN5"
+constexpr uint32_t SETTINGS_MAGIC_V5 = 0x48414E35;  // "HAN5" - bez taryfy
+constexpr uint32_t SETTINGS_MAGIC = 0x48414E36;     // "HAN6"
 
 Settings cfg;
 uint8_t aesKey[16];
@@ -357,6 +359,145 @@ void trackVoltage(const MeterData &d) {
   }
 }
 
+// ---------------- Strefy taryfowe ----------------
+// Licznik nie wysyla rejestrow T1..T4, wiec ESP przypisuje kazdy przyrost energii pobranej do strefy wg
+// czasu odczytu (harmonogram TAURON) i podstawia wirtualne rejestry T1..T3 do danych licznika - dzieki temu
+// trafiaja do dobowych stanow, kosztow i na strone. Liczniki strefowe zapisywane w LittleFS.
+struct ZoneState {
+  uint32_t magic;
+  uint32_t since;  // RRRRMMDD - poczatek liczenia
+  uint8_t tariff;
+  double lastImp;  // kWh, ostatni stan licznika
+  double wh[3];    // T1..T3
+};
+const char *ZONE_FILE = "/zones.bin";
+constexpr uint32_t ZONE_MAGIC = 0x5A4F4E31;
+ZoneState zs = {};
+bool zoneDirty = false;
+
+// Swieta ustawowo wolne od pracy (Wielkanoc i Zielone Swiatki wypadaja w niedziele)
+bool isHoliday(int y, int m, int d) {
+  static const uint16_t fixed[] = {101, 106, 501, 503, 815, 1101, 1111, 1225, 1226};
+  int md = m * 100 + d;
+  for (uint16_t f : fixed)
+    if (f == md) return true;
+  if (md == 1224 && y >= 2025) return true;
+  int a = y % 19, b = y / 100, c = y % 100, h = (19 * a + b - b / 4 - (b - (b + 8) / 25 + 1) / 3 + 15) % 30,
+      l = (32 + 2 * (b % 4) + 2 * (c / 4) - h - c % 4) % 7, mm = (a + 11 * h + 22 * l) / 451;
+  tm e = {}, x = {};
+  e.tm_year = x.tm_year = y - 1900;
+  e.tm_mon = (h + l - 7 * mm + 114) / 31 - 1;
+  e.tm_mday = (h + l - 7 * mm + 114) % 31 + 1;
+  x.tm_mon = m - 1;
+  x.tm_mday = d;
+  e.tm_hour = x.tm_hour = 12;
+  long diff = lround(difftime(mktime(&x), mktime(&e)) / 86400);
+  return diff == 1 || diff == 60;  // Poniedzialek Wielkanocny, Boze Cialo
+}
+
+// Strefa 1..3 dla czasu lokalnego t (TAURON)
+int zoneOf(const tm &t) {
+  int h = t.tm_hour, m = t.tm_mon + 1;
+  bool off = t.tm_wday == 0 || t.tm_wday == 6 || isHoliday(t.tm_year + 1900, m, t.tm_mday);
+  bool day12 = (h >= 6 && h < 13) || (h >= 15 && h < 22);
+  switch (cfg.tariff) {
+    case 1: return day12 ? 1 : 2;                 // G12: T1 6-13, 15-22; T2 13-15, 22-6
+    case 2: return off ? 2 : day12 ? 1 : 2;       // G12w: jak G12, weekendy i swieta cale T2
+    case 3:                                       // G13 (dni robocze)
+      if (off) return 3;
+      if (h >= 7 && h < 13) return 1;
+      if (m >= 4 && m <= 9 ? h >= 19 && h < 22 : h >= 16 && h < 21) return 2;
+      return 3;
+  }
+  return 0;
+}
+
+// Czas lokalny odczytu: z zegara licznika, a gdy go brak - z zegara ESP
+bool readingTime(const MeterData &d, tm &t) {
+  t = {};
+  if (sscanf(d.dateTime.c_str(), "%d-%d-%d %d:%d:%d", &t.tm_year, &t.tm_mon, &t.tm_mday, &t.tm_hour, &t.tm_min,
+             &t.tm_sec) >= 5 && t.tm_year >= 2024) {
+    t.tm_year -= 1900;
+    t.tm_mon -= 1;
+    t.tm_isdst = -1;
+    mktime(&t);  // uzupelnia dzien tygodnia
+    return true;
+  }
+  time_t now = nowEpoch();
+  if (!now) return false;
+  localtime_r(&now, &t);
+  return true;
+}
+
+void saveZones() {
+  if (!fsOk || !zoneDirty) return;
+  File f = LittleFS.open(ZONE_FILE, "w");
+  if (!f) return;
+  f.write((const uint8_t *)&zs, sizeof zs);
+  zoneDirty = false;
+}
+
+void loadZones() {
+  File f = LittleFS.open(ZONE_FILE, "r");
+  if (!f || f.read((uint8_t *)&zs, sizeof zs) != sizeof zs || zs.magic != ZONE_MAGIC) zs = {};
+}
+
+void applyZones(MeterData &d) {
+  if (!cfg.tariff || isnan(d.importKWh[0])) return;
+  for (int i = 1; i <= 4; i++)
+    if (!isnan(d.importKWh[i])) return;  // licznik ma wlasne rejestry taryf
+  tm t;
+  if (!readingTime(d, t)) return;
+  if (zs.magic != ZONE_MAGIC || zs.tariff != cfg.tariff) {
+    zs = {ZONE_MAGIC, currentDate(d), cfg.tariff, d.importKWh[0], {0, 0, 0}};
+    zoneDirty = true;
+    Serial.printf("Strefy taryfowe: start liczenia od %.3f kWh\n", d.importKWh[0]);
+  }
+  double dl = d.importKWh[0] - zs.lastImp;
+  if (dl < 0 || dl > 100) {  // wymiana licznika / blad - zaczyna od biezacego stanu
+    zs.lastImp = d.importKWh[0];
+    zoneDirty = true;
+  } else if (dl > 0) {
+    zs.wh[zoneOf(t) - 1] += dl * 1000;
+    zs.lastImp = d.importKWh[0];
+    zoneDirty = true;
+  }
+  for (int i = 0; i < (cfg.tariff == 3 ? 3 : 2); i++) d.importKWh[i + 1] = zs.wh[i] / 1000;
+}
+
+// ---------------- Moc maksymalna dzis ----------------
+// Licznik nie wysyla mocy maksymalnej - najwieksza moc pobierana w biezacej dobie (po restarcie
+// uzupelniana z historii 30-sekundowych srednich).
+double dayMaxW = NAN;
+uint32_t dayMaxAt = 0, dayMaxDate = 0;
+
+void trackMax(const MeterData &d) {
+  uint32_t date = currentDate(d), now = nowEpoch();
+  if (!date) return;
+  if (date != dayMaxDate) {
+    dayMaxDate = date;
+    dayMaxW = NAN;
+    dayMaxAt = 0;
+    if (now) {
+      tm lt;
+      time_t tt = now;
+      localtime_r(&tt, &lt);
+      uint32_t mid = now - lt.tm_hour * 3600 - lt.tm_min * 60 - lt.tm_sec;
+      for (int i = 0; i < histCount; i++) {
+        const Sample &s = histAt(i);
+        if (s.t >= mid && s.imp != HIST_NONE && (isnan(dayMaxW) || s.imp > dayMaxW)) {
+          dayMaxW = s.imp;
+          dayMaxAt = s.t;
+        }
+      }
+    }
+  }
+  if (!isnan(d.powerImportW) && (isnan(dayMaxW) || d.powerImportW > dayMaxW)) {
+    dayMaxW = d.powerImportW;
+    dayMaxAt = now;
+  }
+}
+
 // ---------------- Ustawienia ----------------
 
 bool parseKey(const String &hex, uint8_t *out) {
@@ -397,6 +538,10 @@ void loadSettings() {
   }
   if (cfg.magic == SETTINGS_MAGIC_V4) {
     cfg.appUser[0] = cfg.appPass[0] = 0;
+    cfg.magic = SETTINGS_MAGIC_V5;
+  }
+  if (cfg.magic == SETTINGS_MAGIC_V5) {
+    cfg.tariff = 0;
     cfg.magic = SETTINGS_MAGIC;
   }
   if (cfg.magic != SETTINGS_MAGIC) {
@@ -416,6 +561,7 @@ void loadSettings() {
   for (float &p : cfg.price)
     if (isnan(p) || p < 0) p = 0;
   if (isnan(cfg.fee) || cfg.fee < 0) cfg.fee = 0;
+  if (cfg.tariff > 3) cfg.tariff = 0;
   applySettings();
 }
 
@@ -463,6 +609,8 @@ void handleFrame(const uint8_t *f, int len) {
 
   bool selected = meterIdFilter.isEmpty() || meterIdFilter == d.linkId || meterIdFilter == d.serial;
   if (r == FrameResult::Ok && selected) {
+    applyZones(d);
+    trackMax(d);
     meter = d;
     meterUpdatedMs = millis();
     meterRssi = dev.rssi;
@@ -666,6 +814,7 @@ void handleJson() {
     j += num(cfg.price[t] > 0 ? cfg.price[t] : NAN, 4);
   }
   j += "],\"fee_month\":" + num(cfg.fee, 2);
+  j += ",\"tariff\":" + String(cfg.tariff) + ",\"zones_since\":" + String(cfg.tariff && zs.magic == ZONE_MAGIC ? zs.since : 0);
   j += ",\"cloud\":{\"id\":\"" + jsonEscape(cfg.cloudId) + "\",\"app_user\":\"" + jsonEscape(cfg.appUser) + "\",\"registered\":" +
        String(cfg.cloudId[0] && cfg.cloudKey[0] ? "true" : "false") + ",\"url\":\"" + jsonEscape(cloudBase()) +
        "\",\"interval_s\":" + String(cloudIntervalS()) +
@@ -688,6 +837,8 @@ void handleJson() {
     j += ",\"power_export_w\":" + num(meter.powerExportW, 0);
     j += ",\"power_max_w\":" + num(meter.maxPowerW, 0);
     j += ",\"power_limit_w\":" + num(meter.powerLimitW, 0);
+    if (dayMaxDate == currentDate(meter) && !isnan(dayMaxW))
+      j += ",\"today_max_w\":" + num(dayMaxW, 0) + ",\"today_max_at\":" + String(dayMaxAt);
     for (int p = 0; p < 3; p++) j += ",\"voltage_l" + String(p + 1) + "\":" + num(meter.voltage[p], 1);
     ensureStarts(currentDate(meter));
     if (hasDayStart) {
@@ -775,6 +926,7 @@ void handleConfig() {
   }
   for (int t = 0; t < 4; t++) cfg.price[t] = max(0.0f, argFloat("p" + String(t + 1), cfg.price[t]));
   cfg.fee = max(0.0f, argFloat("fee", cfg.fee));
+  if (server.hasArg("tariff")) cfg.tariff = constrain(server.arg("tariff").toInt(), 0, 3);
   if (server.arg("cloud_forget") == "1") cfg.cloudId[0] = cfg.cloudKey[0] = cfg.appUser[0] = cfg.appPass[0] = 0;
   if (server.hasArg("pass") && !server.arg("pass").isEmpty()) {
     String p = server.arg("pass");
@@ -981,6 +1133,7 @@ void setup() {
   loadDays();
   loadHistory();
   loadVolt();
+  loadZones();
   Serial.printf("LittleFS: %s, zapisanych dob: %u, probek mocy: %d, odchylen napiecia: %u\n", fsOk ? "OK" : "BLAD",
                 (unsigned)dayCount, histCount, (unsigned)voltCount);
   configTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
@@ -995,6 +1148,7 @@ void setup() {
   ArduinoOTA.setHostname(HOSTNAME);
   ArduinoOTA.onStart([] {
     saveHistory();
+    saveZones();
     closeAllVolt();
     Serial.println("OTA: start");
   });
@@ -1030,6 +1184,7 @@ void loop() {
   if (millis() - lastHistSave > HIST_SAVE_MS) {
     lastHistSave = millis();
     saveHistory();
+    saveZones();
   }
 
   static uint32_t lastCloud = 0;

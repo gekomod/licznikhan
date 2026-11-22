@@ -37,5 +37,7 @@
 // ---------------- Chmura (mini cloud) ----------------
 // Rejestracja: POST {CLOUD_URL}/api/device/register (przycisk na stronie WWW), potem pomiary POST-em na
 // /api/device/measurements z naglowkami X-Device-ID / X-Device-Key. Adres i interwal moze zmienic odpowiedz rejestracji.
+#ifndef CLOUD_URL
 #define CLOUD_URL        "https://cloud.nasdom.tech"
+#endif
 #define CLOUD_INTERVAL_S 60
