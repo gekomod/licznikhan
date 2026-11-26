@@ -158,7 +158,7 @@ void loadHistory() {
 
 // ---------------- Dobowe stany licznika ----------------
 // Pierwszy poprawny odczyt kazdej doby jest dopisywany do pliku w LittleFS (28 B/dobe), plik jest
-// posortowany po dacie. Stany wpisane recznie (np. z rachunku) maja ustawiony bit DAY_MANUAL w dacie.
+// posortowany po dacie. (Starsze wersje trzymaly tu tez stany z rachunku z bitem DAY_MANUAL - patrz migrateManualDays.)
 // Zuzycie dni i miesiecy liczy strona WWW.
 struct DayRec {
   uint32_t date;    // RRRRMMDD (+ DAY_MANUAL)
@@ -193,7 +193,9 @@ uint32_t currentDate(const MeterData &d) {
   return (lt.tm_year + 1900) * 10000 + (lt.tm_mon + 1) * 100 + lt.tm_mday;
 }
 
+void migrateManualDays();
 void loadDays() {
+  migrateManualDays();
   File f = LittleFS.open(DAYS_FILE, "r");
   if (!f) return;
   dayCount = f.size() / sizeof(DayRec);
@@ -254,37 +256,73 @@ void recordDay(const MeterData &d) {
   if (++dayCount > DAYS_MAX) trimFile(DAYS_FILE, sizeof(DayRec), dayCount, DAYS_KEEP);
 }
 
-// Wstawia/zastepuje stan z dnia nr.date albo (del) usuwa go; zachowuje kolejnosc dat
-bool putDay(const DayRec &nr, bool del) {
-  File in = LittleFS.open(DAYS_FILE, "r"), out = LittleFS.open("/days.tmp", "w");
+// ---------------- Odczyty z rachunku ----------------
+// Stany licznika wpisane recznie (np. z faktury) z kwota do zaplaty. Trzymane osobno od dobowych stanow,
+// zeby nie psuly zuzycia dni wyliczanego z automatycznych odczytow - strona pokazuje je jako znaczniki,
+// a do historii dolacza tylko te sprzed pierwszego automatycznego stanu (okres przed montazem czujnika).
+struct ReadRec {
+  uint32_t date;    // RRRRMMDD
+  uint32_t imp[3];  // Wh: pobor, T1, T2 (DAY_NONE = brak)
+  uint32_t exp;     // Wh
+  uint32_t amount;  // grosze do zaplaty (DAY_NONE = brak)
+};
+const char *READS_FILE = "/reads.bin";
+constexpr size_t READS_MAX = 200;
+
+// Wstawia/zastepuje odczyt z dnia nr.date albo (del) usuwa go; zachowuje kolejnosc dat
+bool putReading(const ReadRec &nr, bool del) {
+  File in = LittleFS.open(READS_FILE, "r"), out = LittleFS.open("/reads.tmp", "w");
   if (!out) return false;
-  uint32_t nd = dayOf(nr), last = 0;
   size_t n = 0;
   bool done = false;
-  DayRec r;
-  auto put = [&](const DayRec &x) {
-    out.write((const uint8_t *)&x, sizeof x);
-    last = dayOf(x);
+  ReadRec r;
+  auto put = [&](const ReadRec &x) {
+    if (n < READS_MAX) out.write((const uint8_t *)&x, sizeof x);
     n++;
   };
   while (in && in.read((uint8_t *)&r, sizeof r) == sizeof r) {
-    uint32_t d = dayOf(r);
-    if (!done && d >= nd) {
+    if (!done && r.date >= nr.date) {
       done = true;
       if (!del) put(nr);
-      if (d == nd) continue;
+      if (r.date == nr.date) continue;
     }
     put(r);
   }
   if (!done && !del) put(nr);
-  in.close();
+  if (in) in.close();
+  out.close();
+  LittleFS.remove(READS_FILE);
+  LittleFS.rename("/reads.tmp", READS_FILE);
+  return true;
+}
+
+// Starsze wersje zapisywaly odczyty z rachunku w /days.bin (bit DAY_MANUAL) - przenosi je do /reads.bin
+void migrateManualDays() {
+  File f = LittleFS.open(DAYS_FILE, "r");
+  if (!f) return;
+  DayRec r;
+  bool any = false;
+  while (f.read((uint8_t *)&r, sizeof r) == sizeof r)
+    if (r.date & DAY_MANUAL) any = true;
+  if (!any) return;
+  f.seek(0);
+  File out = LittleFS.open("/days.tmp", "w");
+  if (!out) return;
+  size_t n = 0;
+  while (f.read((uint8_t *)&r, sizeof r) == sizeof r) {
+    if (r.date & DAY_MANUAL) {
+      ReadRec m = {dayOf(r), {r.imp[0], r.imp[1], r.imp[2]}, r.exp, DAY_NONE};
+      putReading(m, false);
+    } else {
+      out.write((const uint8_t *)&r, sizeof r);
+      n++;
+    }
+  }
+  f.close();
   out.close();
   LittleFS.remove(DAYS_FILE);
   LittleFS.rename("/days.tmp", DAYS_FILE);
-  dayCount = n;
-  lastDay = last;
-  startsFor = 0;
-  return true;
+  Serial.printf("Przeniesiono odczyty reczne do %s, zostalo dob: %u\n", READS_FILE, (unsigned)n);
 }
 
 // ---------------- Odchylenia napiecia ----------------
@@ -986,7 +1024,7 @@ void handleCloudApp() {
               "{\"user\":\"" + jsonEscape(cfg.appUser) + "\",\"pass\":\"" + jsonEscape(cfg.appPass) + "\"}");
 }
 
-// POST /reading - reczny stan licznika z dnia (np. z rachunku): date=RRRR-MM-DD, imp, t1, t2, exp [kWh]; del=1 usuwa
+// POST /reading - stan licznika z rachunku: date=RRRR-MM-DD, imp, t1, t2, exp [kWh], amount [zl]; del=1 usuwa
 void handleReading() {
   if (!checkAuth()) return;
   if (!fsOk) return sendError("Pamięć flash niedostępna.");
@@ -994,20 +1032,28 @@ void handleReading() {
   if (sscanf(server.arg("date").c_str(), "%d-%d-%d", &y, &m, &d) != 3 || y < 2000 || y > 2099 || m < 1 || m > 12 ||
       d < 1 || d > 31)
     return sendError("Niepoprawna data.");
-  DayRec r = {(uint32_t)(y * 10000 + m * 100 + d) | DAY_MANUAL, {DAY_NONE, DAY_NONE, DAY_NONE, DAY_NONE, DAY_NONE},
-              DAY_NONE};
+  ReadRec r = {(uint32_t)(y * 10000 + m * 100 + d), {DAY_NONE, DAY_NONE, DAY_NONE}, DAY_NONE, DAY_NONE};
   bool del = server.arg("del") == "1";
   if (!del) {
     uint32_t today = currentDate(meter);
-    if (today && dayOf(r) > today) return sendError("Data z przyszłości.");
-    auto wh = [](float v) { return v > 0 ? toWh(v) : DAY_NONE; };
-    r.imp[0] = wh(argFloat("imp", 0));
-    r.imp[1] = wh(argFloat("t1", 0));
-    r.imp[2] = wh(argFloat("t2", 0));
-    r.exp = wh(argFloat("exp", 0));
+    if (today && r.date > today) return sendError("Data z przyszłości.");
+    auto num = [](const char *name) {
+      String s = server.arg(name);
+      s.trim();
+      s.replace(" ", "");
+      s.replace(',', '.');
+      return s.isEmpty() ? 0.0 : s.toDouble();
+    };
+    auto wh = [](double v) { return v > 0 ? toWh(v) : DAY_NONE; };
+    r.imp[0] = wh(num("imp"));
+    r.imp[1] = wh(num("t1"));
+    r.imp[2] = wh(num("t2"));
+    r.exp = wh(num("exp"));
+    double a = num("amount");
+    if (a > 0) r.amount = (uint32_t)llround(a * 100);
     if (r.imp[0] == DAY_NONE) return sendError("Podaj stan energii pobranej (kWh).");
   }
-  if (!putDay(r, del)) return sendError("Błąd zapisu.");
+  if (!putReading(r, del)) return sendError("Błąd zapisu.");
   redirectHome();
 }
 
@@ -1035,7 +1081,8 @@ void handleHistory() {
   server.sendContent("");
 }
 
-// /days - dobowe stany licznika [RRRRMMDD, pobor, T1..T4, oddanie (, 1 = wpisany recznie)] w Wh
+// /days - d: dobowe stany licznika [RRRRMMDD, pobor, T1..T4, oddanie] w Wh;
+//         r: odczyty z rachunku [RRRRMMDD, pobor, T1, T2, oddanie (Wh), kwota (grosze)]
 void handleDays() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
@@ -1055,12 +1102,26 @@ void handleDays() {
     buf += dayOf(r);
     for (uint32_t v : r.imp) add(v);
     add(r.exp);
-    if (r.date & DAY_MANUAL) buf += ",1";
     buf += ']';
     if (buf.length() > 1200) {
       server.sendContent(buf);
       buf = "";
     }
+  }
+  if (f) f.close();
+  buf += "],\"r\":[";
+  f = LittleFS.open(READS_FILE, "r");
+  ReadRec q;
+  first = true;
+  while (f && f.read((uint8_t *)&q, sizeof q) == sizeof q) {
+    if (!first) buf += ',';
+    first = false;
+    buf += '[';
+    buf += q.date;
+    for (uint32_t v : q.imp) add(v);
+    add(q.exp);
+    add(q.amount);
+    buf += ']';
   }
   buf += "]}";
   server.sendContent(buf);

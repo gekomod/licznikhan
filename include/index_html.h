@@ -106,6 +106,9 @@ box-shadow:0 0 0 7px color-mix(in oklch,var(--nc) 10%,transparent),0 0 40px colo
 .db i.hi{background:var(--o)}.db i.dm{opacity:.5}.db:hover i{background:var(--text);opacity:1}
 .db .tt{display:none;position:absolute;left:50%;transform:translateX(-50%);padding:4px 8px;border-radius:8px;background:var(--text);color:var(--bg);font-size:11px;font-weight:700;white-space:nowrap;z-index:4}
 .db:hover .tt{display:block}.db:first-child .tt,.db:nth-child(2) .tt{left:0;transform:none}.db:last-child .tt,.db:nth-last-child(2) .tt{left:auto;right:0;transform:none}
+.db .rd{position:absolute;left:50%;top:-22px;bottom:0;border-left:2px solid var(--b);z-index:2;pointer-events:none}
+.db .rd span{position:absolute;top:0;left:4px;font-size:10px;font-weight:700;color:var(--b);white-space:nowrap;background:var(--card);padding:0 3px;border-radius:4px}
+.db .rd.rt span{left:auto;right:4px}
 .dlab{display:flex;gap:4px;padding-top:6px}.dlab span{flex:1 1 0;min-width:0;text-align:center;font-size:10px;color:var(--muted)}.dlab .we{color:var(--red);font-weight:700}
 .mbars{display:flex;gap:4px;align-items:stretch}
 .mbars button{flex:1 1 0;min-width:0;padding:8px 2px;border:0;border-radius:12px;background:transparent;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--muted)}
@@ -278,10 +281,11 @@ td{padding:8px;border-bottom:1px solid var(--bdr);vertical-align:top}.hex{word-b
    <div class="f"><label>Opłaty stałe (abonament, opłaty sieciowe), zł/mies.</label><input class="in" name="fee" id="fee" inputmode="decimal"></div>
    <button class="btn pri mt-a">Zapisz ceny</button></form></div>
   <div class="card"><form method="post" action="/reading"><h3>Stan licznika z rachunku</h3>
-   <p class="sub" style="margin:0">Uzupełnia historię sprzed montażu czujnika. Zużycie między stanami jest rozkładane równo na dni.</p>
+   <p class="sub" style="margin:0">Pokazywany na wykresie zużycia dziennego jako pionowa kreska ze stanem i kwotą. Stany sprzed montażu czujnika uzupełniają też historię (zużycie rozkładane równo na dni).</p>
    <div class="g2"><div class="f"><label>Data odczytu</label><input class="in" type="date" name="date" required></div><div class="f"><label>Pobór, kWh</label><input class="in" name="imp" inputmode="decimal" required></div>
     <div class="f"><label>T1, kWh</label><input class="in" name="t1" inputmode="decimal" placeholder="opcjonalnie"></div><div class="f"><label>T2, kWh</label><input class="in" name="t2" inputmode="decimal" placeholder="opcjonalnie"></div>
-    <div class="f"><label>Oddanie, kWh</label><input class="in" name="exp" inputmode="decimal" placeholder="opcjonalnie"></div></div>
+    <div class="f"><label>Oddanie, kWh</label><input class="in" name="exp" inputmode="decimal" placeholder="opcjonalnie"></div>
+    <div class="f"><label>Do zapłaty, zł</label><input class="in" name="amount" inputmode="decimal" placeholder="opcjonalnie"></div></div>
    <button class="btn mt-a">Dodaj stan</button></form><div id="manual"></div></div>
   <div class="card"><form method="post" action="/config"><h3>Licznik</h3>
    <div class="f"><label>Klucz AES (32 znaki hex, z TAURON eLicznik)</label><input class="in mono" name="key" placeholder="pozostaw puste, aby nie zmieniać" autocomplete="off"></div>
@@ -360,7 +364,7 @@ async function load(){
    h.s.forEach(s=>H.push({t:s[0],i:s[1],e:s[2]}));if(H.length)hLast=H[H.length-1].t;
    H=H.filter(p=>p.t>(j.time||1e10)-22000);hSync=Date.now()}catch(e){}}
   const last=D.length?D[D.length-1][0]:0;
-  if(Date.now()-dSync>(last==todayN()?600000:60000)){try{D=(await(await fetch('/days',{cache:'no-store'})).json()).d;dSync=Date.now();mDrawn=0}catch(e){}}
+  if(Date.now()-dSync>(last==todayN()?600000:60000)){try{const dj=await(await fetch('/days',{cache:'no-store'})).json();D=dj.d;R=dj.r||[];dSync=Date.now();mDrawn=0}catch(e){}}
   if(Date.now()-vSync>60000)await loadVolt();
   vpush(j);render(j)}catch(e){console.error(e);offline()}}
 const DOT={ok:'g',warn:'amb',bad:'red'},chip=(s,t)=>`<span class="chip"><span class="dot" style="background:var(--${DOT[s]||'muted'})"></span>${t}</span>`,
@@ -456,10 +460,13 @@ const dnum=(y,m,d)=>Math.round(Date.UTC(y,m,d)/864e5),dof=n=>new Date(n*864e5),d
 const todayN=()=>{const n=new Date();return n.getFullYear()*1e4+(n.getMonth()+1)*100+n.getDate()};
 const mlab=(k,l)=>l?MF[k%100-1]+' '+Math.floor(k/100):MN[k%100-1];
 const kwh=(v,d=1)=>v==null?'–':fx(v/1000,d);
-let D=[],dSync=0,mRange=ls('mr',12),selM=0,mDrawn=0,DAYS={},MON=[];
-// Zuzycie doby = roznica kolejnych stanow; przy przerwie w odczytach rozkladane rowno na dni (szacunek)
+let D=[],R=[],dSync=0,mRange=ls('mr',12),selM=0,mDrawn=0,DAYS={},MON=[];
+// Zuzycie doby = roznica kolejnych stanow; przy przerwie w odczytach rozkladane rowno na dni (szacunek).
+// Odczyty z rachunku (R) wchodza do historii tylko sprzed pierwszego automatycznego stanu - pozniejsze sa tylko znacznikami.
+const rk=n=>dnum(Math.floor(n/1e4),Math.floor(n/100)%100-1,n%100);
 function calc(){
- const p=D.map(r=>({k:dnum(Math.floor(r[0]/1e4),Math.floor(r[0]/100)%100-1,r[0]%100),v:r.slice(1)})),m=J&&J.meter;
+ const f0=D.length?D[0][0]:1e9,
+  p=[...R.filter(r=>r[0]<f0).map(r=>({k:rk(r[0]),v:[r[1],r[2],r[3],null,null,r[4]]})),...D.map(r=>({k:rk(r[0]),v:r.slice(1)}))],m=J&&J.meter;
  if(m&&m.import_kwh!=null&&m.age_s<900){const n=new Date(),k=dnum(n.getFullYear(),n.getMonth(),n.getDate())+(n.getHours()*3600+n.getMinutes()*60+n.getSeconds())/86400;
   if(!p.length||k>p[p.length-1].k)p.push({k,live:1,v:['import_kwh','import_t1_kwh','import_t2_kwh','import_t3_kwh','import_t4_kwh','export_kwh'].map(x=>m[x]==null?null:Math.round(m[x]*1000))})}
  const days={},M={},pr=J&&J.price&&J.price[0]>0?J.price:null;
@@ -479,7 +486,7 @@ function dayChart(){
  const i=MON.findIndex(q=>q.key==selM);$('dprev').disabled=i<=0;$('dnext').disabled=i<0||i>=MON.length-1;
  $('dname').textContent=selM?' · '+mlab(selM,1):'';
  const y=Math.floor(selM/100),mo=selM%100,it=[];
- if(selM)for(let d=1;d<=dimOf(selM);d++){const o=DAYS[dnum(y,mo-1,d)];it.push({d,o,a:o&&o.v[0]!=null?o.v[0]/1000:null,wd:new Date(y,mo-1,d).getDay()})}
+ if(selM)for(let d=1;d<=dimOf(selM);d++){const o=DAYS[dnum(y,mo-1,d)];it.push({d,o,a:o&&o.v[0]!=null?o.v[0]/1000:null,wd:new Date(y,mo-1,d).getDay(),rd:R.find(r=>r[0]==selM*100+d)})}
  const dd=it.filter(x=>x.a!=null),full=dd.filter(x=>!x.o.live),ref=full.length?full:dd;
  if(!dd.length){$('dstat').innerHTML='';$('davg').textContent='–';$('dchart').innerHTML='<div class="empty">Brak danych.<br>Zestawienie tworzy się z dobowych stanów licznika zapisywanych w pamięci ESP.</div>';return}
  const mx=Math.max(...dd.map(x=>x.a)),hi=dd.reduce((a,x)=>x.a>a.a?x:a),lo=ref.reduce((a,x)=>x.a<a.a?x:a),tot=dd.reduce((s,x)=>s+x.a,0),
@@ -491,7 +498,7 @@ function dayChart(){
  $('dchart').innerHTML=`<div class="dc">${[top,top/2,0].map(v=>`<div class="gline" style="top:${22+100-v/top*100}px"></div><span class="glab" style="top:${22+100-v/top*100}px">${f(v)}</span>`).join('')}
 <div class="avgl" style="top:${(22+100-avg/top*100).toFixed(0)}px"></div>
 <div class="dbars">${it.map(x=>{const h=x.a!=null?Math.max(2,Math.round(x.a/top*100)):0;
- return`<div class="db"><i class="${x.a>avg?'hi':''}${x.o&&(x.o.est||x.o.live)?' dm':''}" style="height:${h}px"></i><span class="tt" style="bottom:${h+6}px">${WD[x.wd]} ${x.d} · ${x.a!=null?fx(x.a,1)+' kWh'+(x.o.cost!=null?' · '+zl(x.o.cost):'')+(x.o.live?' (w toku)':x.o.est?' (szac.)':''):'brak danych'}</span></div>`}).join('')}</div>
+ return`<div class="db">${x.rd?`<b class="rd${x.d>dimOf(selM)/2?' rt':''}"><span>Odczyt ${rdTxt(x.rd)}</span></b>`:''}<i class="${x.a>avg?'hi':''}${x.o&&(x.o.est||x.o.live)?' dm':''}" style="height:${h}px"></i><span class="tt" style="bottom:${h+6}px">${WD[x.wd]} ${x.d} · ${x.a!=null?fx(x.a,1)+' kWh'+(x.o.cost!=null?' · '+zl(x.o.cost):'')+(x.o.live?' (w toku)':x.o.est?' (szac.)':''):'brak danych'}${x.rd?'<br>Odczyt licznika: '+rdTxt(x.rd):''}</span></div>`}).join('')}</div>
 <div class="dlab">${it.map(x=>`<span class="${x.wd==0||x.wd==6?'we':''}">${x.d}</span>`).join('')}</div></div>`}
 // ---- zestawienie miesieczne ----
 function monthBars(){
@@ -513,10 +520,11 @@ function mdet(){
  const tt=[1,2,3,4].filter(c=>q.v[c]>0);if(tt.length>1)tt.forEach(c=>h+=I(zn(c),kwh(q.v[c],0)+' kWh'));
  if(q.v[5]>0)h+=I('Oddane',kwh(q.v[5],0)+' kWh')+I('Bilans',kwh(q.v[0]-q.v[5],0)+' kWh');
  $('mdi').innerHTML=h}
+const rdTxt=r=>kwh(r[1],0)+' kWh'+(r[5]!=null?' · do zapłaty '+zl(r[5]/100):'');
 function manualList(){
  const ds=n=>String(n).replace(/(\d{4})(\d\d)(\d\d)/,'$1-$2-$3');
- $('manual').innerHTML=D.filter(r=>r[7]==1).reverse().map(r=>`<form method="post" action="/reading" class="mrow" onsubmit="return confirm('Usunąć stan z ${ds(r[0])}?')"><input type="hidden" name="date" value="${ds(r[0])}"><input type="hidden" name="del" value="1">
-  <span>${ds(r[0])} · <b>${kwh(r[1],3)} kWh</b>${r[6]!=null?' · oddanie '+kwh(r[6],3)+' kWh':''}</span><button class="btn del" style="padding:3px 10px">Usuń</button></form>`).join('')}
+ $('manual').innerHTML=R.slice().reverse().map(r=>`<form method="post" action="/reading" class="mrow" onsubmit="return confirm('Usunąć stan z ${ds(r[0])}?')"><input type="hidden" name="date" value="${ds(r[0])}"><input type="hidden" name="del" value="1">
+  <span>${ds(r[0])} · <b>${kwh(r[1],3)} kWh</b>${r[4]!=null?' · oddanie '+kwh(r[4],3)+' kWh':''}${r[5]!=null?' · <b>'+zl(r[5]/100)+'</b>':''}</span><button class="btn del" style="padding:3px 10px">Usuń</button></form>`).join('')}
 function drawMonths(){
  mDrawn=Date.now();calc();manualList();
  if(!MON.some(q=>q.key==selM))selM=MON.length?MON[MON.length-1].key:0;
